@@ -1,0 +1,926 @@
+/* See COPYING.txt for license details. */
+
+/*
+*
+*  m1_lab_test.c
+*
+*  M1 Lab_test functions
+*
+* M1 Project
+*
+*/
+
+#include <stdint.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <string.h>
+#include "esp_app_main.h"
+#include "logger.h"
+#include "m1_compile_cfg.h"
+#include "m1_display.h"
+#include "m1_esp32_hal.h"
+#include "m1_deauth.h"
+#include "m1_lcd.h"
+#include "m1_buzzer.h"
+#include "m1_games.h"
+
+#define TAG "LAB_TEST"
+
+/************************** S T R U C T U R E S *******************************/
+
+typedef enum { STATE_NONE, STATE_PREFLIGHT, STATE_MENU, STATE_AP_SELECT, STATE_AP_CONF, STATE_STA_SELECT, STATE_STA_CONF, STATE_ATTACK, STATE_COMPLETE } state_t;
+
+typedef struct {
+    char address[MAX_SIZE_ADDRESS];
+    char name[MAX_SIZE_NAME];
+    uint8_t channel;
+} list_item_t;
+
+/************************** S T A T I C S *************************************/
+
+#define MAIN_MENU_OPTS 3
+static char s_main_menu_options[MAIN_MENU_OPTS][32] = { "Discover Target", "Manual Target", "Reset ESP32"};
+
+static char s_selected_sta[MAX_SIZE_ADDRESS];
+static list_item_t s_selected_ap;
+
+static list_item_t s_list_items[MAX_LIST_ITEMS];
+static uint16_t s_list_count = 0;
+
+static state_t s_state = STATE_NONE;
+static state_t s_state_previous = STATE_NONE;
+
+static bool s_stascan_active = false;
+static bool s_deauth_active = false;
+static bool s_redraw = false;
+
+#define PREFLIGHT_AT_CHECKS 2
+static char PREFLIGHT_AT_COMMANDS[PREFLIGHT_AT_CHECKS][MAX_SIZE_NAME] = { "AT+DEAUTH?", "AT+STASCAN?" };
+static uint8_t s_failed_preflight_tests = 0;
+
+/********************* H E L P E R S ****************************************/
+
+
+static void add_ap(char *name, char *address, uint8_t channel) {
+    if (s_list_count >= MAX_LIST_ITEMS) {
+		M1_LOG_W(TAG, "too many ap discovered (%d), discarding\r\n", s_list_count);
+		return;
+	}
+
+    if (strlen(name) == 0) {
+        snprintf(s_list_items[s_list_count].name, MAX_SIZE_NAME, "hidden %s", address);
+    } else {
+        memcpy(s_list_items[s_list_count].name, name, MAX_SIZE_NAME);
+    }
+
+    memcpy(s_list_items[s_list_count].address, address, MAX_SIZE_ADDRESS);
+    s_list_items[s_list_count].channel = channel;
+
+	s_list_count++;
+	//M1_LOG_N(TAG, "ap discovered (%d)\r\n", s_list_count);
+    s_redraw = true;
+}
+
+static void add_station(char *address) {
+    if (s_list_count >= MAX_LIST_ITEMS) {
+		M1_LOG_W(TAG, "too many stations discovered (%d), discarding\r\n", s_list_count);
+		return;
+	}
+
+    memcpy(s_list_items[s_list_count].address, address, MAX_SIZE_ADDRESS);
+    s_list_items[s_list_count].name[0] = 0;
+    s_list_items[s_list_count].channel = 0;
+
+	s_list_count++;
+	//M1_LOG_N(TAG, "station discovered (%d)\r\n", s_list_count);
+    s_redraw = true;
+}
+
+/*
+ * Parse a +CWLAP line and add to station list.
+ *   This parse method is dependant on sending the preceding at command: "AT+CWLAPOPT=,26"
+ * Format: +CWLAP:("<ssid>","<bssid>",<channel>)
+ */
+static void parse_apscan(const char *line) {
+    char name[MAX_SIZE_NAME] = "";
+    char address[MAX_SIZE_ADDRESS] = "";
+    int channel = 0;
+
+    const char *p = strstr(line, "+CWLAP:");
+    if (!p) return;
+    p +=9; /* skip "+CWLAP:(" */
+
+    /* Parse ssid (up to delim) */
+    const char *delim = strchr(p, '"');
+    if (!delim) return;
+    int len = (delim - p < (int)sizeof(name) - 1) ? (int)(delim - p) : (int)sizeof(name) - 1;
+    memcpy(name, p, len);
+    name[len] = '\0';
+    p = delim + 1;
+
+    /* Skip to bssid  */
+    delim = strchr(p, '"');
+    p = delim + 1;
+
+    /* Parse bssid (up to delim) */
+    delim = strchr(p, '"');
+    if (!delim || (delim - p) >= (int)sizeof(address)) return;
+    memcpy(address, p, delim - p);
+    address[delim - p] = '\0';
+    p = delim + 2;     // Skip to channel marker
+
+    /* Parse channel */
+    channel = (int)strtol(p, NULL, 10);
+
+    if (channel != 0) {
+        add_ap(name, address, channel);
+    }
+}
+
+/*
+ * Parse a +STASCAN line and add to station list.
+ * Format: +STASCAN:("<mac>")
+ */
+static void parse_stascan(const char *line) {
+    char address[MAX_SIZE_ADDRESS] = { "notset" };
+
+    const char *p = strstr(line, "+STASCAN:");
+    if (!p) return;
+    p +=11; /* skip "+STASCAN:(" */
+
+    /* Parse ssid (up to delim) */
+    const char *delim = strchr(p, '"');
+    if (!delim) return;
+    int len = (delim - p < (int)sizeof(address) - 1) ? (int)(delim - p) : (int)sizeof(address) - 1;
+    memcpy(address, p, len);
+    address[len] = '\0';
+
+    add_station(address);
+}
+
+static void parse_query_deauth(const char *line) {
+    int active;
+
+    const char *p = strstr(line, "+DEAUTH:");
+    if (!p) return;
+    p +=9; /* skip   "+DEAUTH:( */
+
+    /* Parse state */
+    active = (int)strtol(p, NULL, 10);
+
+    if (active == 1) {
+        s_deauth_active = true;
+    } else {
+        s_deauth_active = false;
+    }
+}
+
+static void parse_query_stascan(const char *line) {
+    int active;
+
+    const char *p = strstr(line, "+STASCAN:");
+    if (!p) return;
+    p +=10; /* skip "+STASCAN:( */
+
+    /* Parse state */
+    active = (int)strtol(p, NULL, 10);
+
+    if (active == 1) {
+        s_stascan_active = true;
+    } else {
+        s_stascan_active = false;
+    }
+}
+
+/*
+ * Process a buffer that may contain multiple +CWLAP lines.
+ */
+static void process_apscan_response_buffer(const char *buf) {
+    const char *p = buf;
+    while ((p = strstr(p, "+CWLAP:")) != NULL)
+    {
+        /* Find end of this line */
+        const char *eol = strchr(p, '\n');
+        if (!eol) eol = p + strlen(p);
+
+        /* Copy line for parsing */
+        char line[400];
+        int llen = (eol - p < (int)sizeof(line) - 1) ? (int)(eol - p) : (int)sizeof(line) - 1;
+        memcpy(line, p, llen);
+        line[llen] = '\0';
+
+        parse_apscan(line);
+        p = eol;
+    }
+}
+
+/*
+ * Process a buffer that may contain multiple +STASCAN lines.
+ */
+static void process_stascan_response_buffer(const char *buf) {
+    const char *p = buf;
+    while ((p = strstr(p, "+STASCAN:")) != NULL)
+    {
+        /* Find end of this line */
+        const char *eol = strchr(p, '\n');
+        if (!eol) eol = p + strlen(p);
+
+        /* Copy line for parsing */
+        char line[400];
+        int llen = (eol - p < (int)sizeof(line) - 1) ? (int)(eol - p) : (int)sizeof(line) - 1;
+        memcpy(line, p, llen);
+        line[llen] = '\0';
+
+        parse_stascan(line);
+        p = eol;
+    }
+}
+
+/********************* D I S P L A Y  ***************************************/
+
+static void draw_title_bar(const char *title)
+{
+    u8g2_SetDrawColor(&m1_u8g2, M1_DISP_DRAW_COLOR_TXT);
+    u8g2_SetFont(&m1_u8g2, u8g2_font_6x10_tr);
+    u8g2_DrawStr(&m1_u8g2, 2, 10, title);
+    u8g2_DrawHLine(&m1_u8g2, 0, LIST_HEADER_HEIGHT, 128);
+}
+
+static void show_message(const char *title, const char *line1, const char *line2, uint16_t delay_ms)
+{
+    m1_u8g2_firstpage();
+    u8g2_SetDrawColor(&m1_u8g2, M1_DISP_DRAW_COLOR_TXT);
+    u8g2_SetFont(&m1_u8g2, M1_DISP_MAIN_MENU_FONT_N);
+    draw_title_bar(title);
+    if (line1)
+        u8g2_DrawStr(&m1_u8g2, 2, 28, line1);
+    if (line2)
+        u8g2_DrawStr(&m1_u8g2, 2, 40, line2);
+    m1_u8g2_nextpage();
+    if (delay_ms)
+        vTaskDelay(pdMS_TO_TICKS(delay_ms));
+}
+
+static void draw_attack(u8g2_t *u8g2)
+{
+    m1_u8g2_firstpage();
+    draw_title_bar(TITLE_DEFAULT);
+
+    u8g2_SetFont(u8g2, M1_DISP_SUB_MENU_FONT_N);
+    m1_draw_text(u8g2, 4, 28, 72, "Deauth Attack:", TEXT_ALIGN_LEFT);
+
+    u8g2_SetFont(u8g2, M1_DISP_SUB_MENU_FONT_B);
+    m1_draw_text(u8g2, 78, 28, 46, s_deauth_active ? "ON" : "OFF", TEXT_ALIGN_LEFT);
+
+    u8g2_SetFont(u8g2, M1_DISP_FUNC_MENU_FONT_N);
+    m1_draw_text(u8g2, 4, 48, 120, "Press OK to toggle", TEXT_ALIGN_CENTER);
+
+    u8g2_SetFont(&m1_u8g2, u8g2_font_6x10_tr);
+    m1_draw_bottom_bar(u8g2, arrowleft_8x8, "Back", "End", arrowright_8x8);
+    m1_u8g2_nextpage();
+
+	s_redraw = false;
+}
+
+static void draw_complete(u8g2_t *u8g2)
+{
+    m1_u8g2_firstpage();
+    draw_title_bar(TITLE_DEFAULT);
+
+    u8g2_SetFont(u8g2, M1_DISP_SUB_MENU_FONT_N);
+    m1_draw_text(u8g2, 4, 28, 72, "Attack complete", TEXT_ALIGN_CENTER);
+
+    m1_draw_bottom_bar(u8g2, arrowleft_8x8, "Back", "Menu", arrowright_8x8);
+    m1_u8g2_nextpage();
+
+	s_redraw = false;
+}
+
+static void draw_confirmation(u8g2_t *u8g2)
+{
+    char prn_msg[128];
+
+    m1_u8g2_firstpage();
+    u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_TXT);
+
+    if (s_state == STATE_AP_CONF)
+        snprintf(prn_msg, sizeof(prn_msg), "Confirm Access Point");
+    else
+        snprintf(prn_msg, sizeof(prn_msg), "Confirm Station");
+    draw_title_bar(prn_msg);
+
+    u8g2_SetFont(u8g2, u8g2_font_5x8_tr);
+    snprintf(prn_msg, sizeof(prn_msg), "Name: %s", s_selected_ap.name);
+    u8g2_DrawStr(u8g2, 4, 21, prn_msg);
+    snprintf(prn_msg, sizeof(prn_msg), "Channel: %u", s_selected_ap.channel);
+    u8g2_DrawStr(u8g2, 4, 31, prn_msg);
+    snprintf(prn_msg, sizeof(prn_msg), "BSSID: %s", s_selected_ap.address);
+    u8g2_DrawStr(u8g2, 4, 41, prn_msg);
+    if (s_state == STATE_STA_CONF) {
+        snprintf(prn_msg, sizeof(prn_msg), "MAC:   %s", s_selected_sta);
+        u8g2_DrawStr(u8g2, 4, 51, prn_msg);
+    }
+
+    m1_draw_bottom_bar(u8g2, arrowleft_8x8, "Back", "Ok", arrowright_8x8);
+    m1_u8g2_nextpage();
+
+	s_redraw = false;
+}
+
+static void draw_list(u8g2_t *u8g2, char *title, uint16_t count, uint16_t selection)
+{
+    uint16_t i;
+    uint16_t start_idx;
+    uint16_t visible;
+    uint8_t y;
+
+    /* Calculate which items are visible */
+    if (selection < LIST_VISIBLE_ITEMS)
+        start_idx = 0;
+    else
+        start_idx = selection - LIST_VISIBLE_ITEMS + 1;
+
+    visible = count - start_idx;
+    if (visible > LIST_VISIBLE_ITEMS)
+        visible = LIST_VISIBLE_ITEMS;
+
+    m1_u8g2_firstpage();
+    draw_title_bar(title);
+
+    u8g2_SetFont(u8g2, u8g2_font_5x8_tr);
+
+    if (count > 0 && (s_state == STATE_AP_SELECT || s_state == STATE_STA_SELECT)) {
+        /* List items */
+        for (i = 0; i < visible; i++)
+        {
+            uint16_t idx = start_idx + i;
+            y = LIST_START_Y + (i * LIST_ITEM_HEIGHT);
+
+            if (idx == selection)
+            {
+                u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_TXT);
+                u8g2_DrawBox(u8g2, 0, y, 128, LIST_ITEM_HEIGHT);
+                u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_BG);
+                if (s_state == STATE_AP_SELECT)
+                    u8g2_DrawStr(u8g2, 4, y + 8, s_list_items[idx].name);
+                else
+                    u8g2_DrawStr(u8g2, 4, y + 8, s_list_items[idx].address);
+                u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_TXT);
+            }
+            else
+            {
+                if (s_state == STATE_AP_SELECT)
+                    u8g2_DrawStr(u8g2, 4, y + 8, s_list_items[idx].name);
+                else
+                    u8g2_DrawStr(u8g2, 4, y + 8, s_list_items[idx].address);
+            }
+        }
+
+        /* Scroll indicator */
+        if (count > LIST_VISIBLE_ITEMS)
+        {
+            uint8_t bar_height = (LIST_VISIBLE_ITEMS * LIST_ITEM_HEIGHT * LIST_VISIBLE_ITEMS) / count;
+            uint8_t bar_y;
+
+            if (bar_height < 4)
+                bar_height = 4;
+
+            bar_y = LIST_START_Y + (start_idx * (LIST_VISIBLE_ITEMS * LIST_ITEM_HEIGHT - bar_height))
+                    / (count - LIST_VISIBLE_ITEMS);
+            u8g2_DrawBox(u8g2, 126, bar_y, 2, bar_height);
+        }
+    }
+
+    m1_u8g2_nextpage();
+
+	s_redraw = false;
+}
+
+static void draw_menu(u8g2_t *u8g2, uint16_t selection)
+{
+    uint8_t y;
+
+    m1_u8g2_firstpage();
+    draw_title_bar(TITLE_DEFAULT);
+
+    //u8g2_SetFont(u8g2, u8g2_font_5x8_tr);
+    for (int i = 0; i < MAIN_MENU_OPTS; i++)
+    {
+        y = LIST_START_Y + (i * (LIST_ITEM_HEIGHT + 2));
+
+        if (i == selection)
+        {
+            u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_TXT);
+            u8g2_DrawBox(u8g2, 0, y, 128, LIST_ITEM_HEIGHT);
+            u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_BG);
+            u8g2_DrawStr(u8g2, 4, y + 8, s_main_menu_options[i]);
+            u8g2_SetDrawColor(u8g2, M1_DISP_DRAW_COLOR_TXT);
+        }
+        else
+        {
+            u8g2_DrawStr(u8g2, 4, y + 8, s_main_menu_options[i]);
+        }
+    }
+
+    m1_draw_bottom_bar(u8g2, arrowleft_8x8, "Exit", "Select", arrowright_8x8);
+    m1_u8g2_nextpage();
+
+	s_redraw = false;
+}
+
+static void draw_preflight_failed(u8g2_t *u8g2) {
+    char prn_msg[128];
+    uint8_t tests = s_failed_preflight_tests;
+
+	m1_u8g2_firstpage();
+
+    /* small title bar */
+    snprintf(prn_msg, sizeof(prn_msg), "Failed Preflight Chk: %d", tests);
+    u8g2_SetDrawColor(&m1_u8g2, M1_DISP_DRAW_COLOR_TXT);
+    u8g2_SetFont(u8g2, u8g2_font_5x8_tr);
+    u8g2_DrawStr(u8g2, 2, 10, prn_msg);
+    u8g2_DrawHLine(u8g2, 0, LIST_HEADER_HEIGHT, 128);
+
+    u8g2_SetFont(u8g2, u8g2_font_4x6_tr);
+    u8g2_DrawStr(u8g2, 4, 22, "Missing AT Cmds: update ESP32");
+
+    int i = 0;
+    int start_y = 32;
+    for (int c = 0; c < PREFLIGHT_AT_CHECKS; c++) {
+        if (tests & 1) {
+            u8g2_DrawStr(u8g2, 4, start_y + (i * LIST_ITEM_HEIGHT), PREFLIGHT_AT_COMMANDS[c]);
+            i++;
+        }
+        tests = tests >> 1;
+     }
+
+     m1_draw_text(u8g2, 4, 62, 120, "Press back to exit", TEXT_ALIGN_CENTER);
+	 m1_u8g2_nextpage();
+
+	 s_redraw = false;
+}
+
+static void deauth_start(uint8_t channel, char *bssid, char *mac) {
+	char resp_buf[AT_RESP_BUF_SIZE];
+    char at_cmd[128];
+
+    snprintf(at_cmd, sizeof(at_cmd), "AT+DEAUTH=1,%d,\"%s\",\"%s\"\r\n", channel, bssid, mac);
+    resp_buf[0] = 0;
+    spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 3);
+
+    s_deauth_active = true;
+}
+
+static void deauth_stop() {
+    char resp_buf[AT_RESP_BUF_SIZE];
+    spi_AT_send_recv("AT+DEAUTH=0\r\n", resp_buf, sizeof(resp_buf), 1);
+
+    s_deauth_active = false;
+}
+
+static void stascan_stop() {
+    char resp_buf[AT_RESP_BUF_SIZE];
+    spi_AT_send_recv("AT+STASCAN=0\r\n", resp_buf, sizeof(resp_buf), 1);
+
+    s_deauth_active = false;
+}
+
+/********************* M A I N   S C A N   L O G I C *************************/
+
+/*************** F U N C T I O N   I M P L E M E N T A T I O N ****************/
+
+/*============================================================================*/
+/*
+ * "This function initializes display for this sub-menu item.
+ */
+/*============================================================================*/
+void menu_lab_test_deauth_init(void)
+{
+	s_state = s_state_previous = STATE_NONE;
+
+} // void menu_lab_test_init(void)
+
+/*============================================================================*/
+/*
+ * This function will exit this sub-menu and return to the upper level menu.
+ */
+/*============================================================================*/
+void menu_lab_test_deauth_exit(void)
+{
+	;
+} // void menu_lab_test_exit(void)
+
+// Current erra
+
+/*============================================================================*/
+/**
+  * @brief
+  * @param
+  * @retval
+  */
+/*============================================================================*/
+void lab_test_deauth(void)
+{
+    bool esp_at_error = false;
+	char resp_buf[AT_LARGE_RESP_BUF_SIZE];
+    char at_cmd[150];
+    char temp_title[MAX_SIZE_TITLE];
+    game_button_t btn = GAME_BTN_NONE;
+    uint16_t selection = 0;
+
+	resp_buf[0] = '\0';
+    temp_title[0] = '\0';
+
+    /* Init ESP32 if needed */
+    show_message(TITLE_SYSTEM_CHECK, "Checking ESP32 init status", NULL, 0);
+    if (!m1_esp32_get_init_status())
+    {
+        m1_esp32_init();
+    }
+    if (!get_esp32_main_init_status())
+    {
+        show_message(TITLE_SYSTEM_CHECK, "Initializing ESP32", NULL, 0);
+        esp32_main_init();
+    }
+
+    if (!get_esp32_main_init_status())
+    {
+        show_message(TITLE_SYSTEM_CHECK, "ESP32 not ready!", "Press Back", 0);
+        goto wait_exit;
+    }
+
+	s_redraw = true;
+
+	while (1)
+    {
+		switch (s_state)
+		{
+		case STATE_NONE:
+            s_state = STATE_PREFLIGHT;
+			continue;
+			break;
+
+        // ---------------------------------------
+		case STATE_PREFLIGHT:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_redraw = true;
+
+                show_message(TITLE_DEFAULT, "Starting Preflight", NULL, 0);
+
+                s_failed_preflight_tests = 0;
+                for (int i = 0; i < PREFLIGHT_AT_CHECKS; i++) {
+                    snprintf(at_cmd, sizeof(at_cmd), "%s\r\n", PREFLIGHT_AT_COMMANDS[i]);
+
+                    spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 1);
+
+                    if (strstr(resp_buf, "TIMEOUT") || strstr(resp_buf, "SEND_ERR")) {
+                        esp_at_error = true;
+                    } else if (strstr(resp_buf, "ERROR")) {
+                        s_failed_preflight_tests |= (1 << i);
+                    }
+
+                    vTaskDelay(pdMS_TO_TICKS(MULTI_AT_CMD_INTERVAL_MS));
+                }
+			}
+
+            if (esp_at_error) {
+                if (s_redraw) {
+                    show_message(TITLE_ERROR, "ESP32 Comm Failure", "Press back to exit", 0);
+                    s_redraw = false;
+                }
+            } else if (s_failed_preflight_tests != 0) {
+                if (s_redraw)
+				    draw_preflight_failed(&m1_u8g2);
+            } else {
+                s_state++;
+				continue;
+            }
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            }
+			break;
+
+        // ---------------------------------------
+		case STATE_MENU:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                selection = 0;
+                s_redraw = true;
+
+                show_message(TITLE_DEFAULT, "Starting menu", NULL, 0);
+
+                resp_buf[0] = 0;
+                snprintf(at_cmd, sizeof(at_cmd), "AT+DEAUTH?\r\n");
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 5);
+                parse_query_deauth(resp_buf);
+
+                vTaskDelay(pdMS_TO_TICKS(MULTI_AT_CMD_INTERVAL_MS));
+
+                resp_buf[0] = 0;
+                snprintf(at_cmd, sizeof(at_cmd), "AT+STASCAN?\r\n");
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 5);
+                parse_query_stascan(resp_buf);
+
+                if (s_deauth_active)
+                    deauth_stop();
+
+                if (s_stascan_active)
+                    stascan_stop();
+            }
+
+			if (s_redraw)
+                draw_menu(&m1_u8g2, selection);
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_UP) {
+                if (selection > 0)
+                    selection--;
+                else
+                    selection = MAIN_MENU_OPTS - 1;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_DOWN) {
+                if (selection < MAIN_MENU_OPTS - 1)
+                    selection++;
+                else
+                    selection = 0;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_LEFT) {
+                btn = GAME_BTN_BACK;
+                break;
+            } else if (btn == GAME_BTN_RIGHT) {
+                if (selection == 0) {
+                    s_state++;
+                } else if (selection == 2) {
+                    show_message(TITLE_DEFAULT, "Resetting ESP32", NULL, 0);
+
+                    // Reset the ESP module
+                    esp32_disable();
+                    m1_hard_delay(1);
+                    esp32_enable();
+                    /* stop spi transactions short time to avoid slave sync issues */
+                    m1_hard_delay(200);
+
+                    vTaskDelay(pdMS_TO_TICKS(1000)); // Adding additional delay for user message
+                    s_redraw = true;
+                } else {
+                    m1_buzzer_notification();
+                    show_message(TITLE_DEFAULT, "Feature not", "implemented yet", 1500);
+                    s_redraw = true;
+                }
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_AP_SELECT:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_list_count = 0;
+                selection = 0;
+                s_redraw = true;
+
+                show_message(TITLE_DEFAULT, "Starting APSCAN", NULL, 0);
+
+                snprintf(at_cmd, sizeof(at_cmd), "AT+CWMODE=1\r\n");
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 1);
+
+                vTaskDelay(pdMS_TO_TICKS(MULTI_AT_CMD_INTERVAL_MS));
+
+                snprintf(at_cmd, sizeof(at_cmd), "AT+CWLAPOPT=,26\r\n");
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 1);
+
+                vTaskDelay(pdMS_TO_TICKS(MULTI_AT_CMD_INTERVAL_MS));
+
+                resp_buf[0] = 0;
+                snprintf(at_cmd, sizeof(at_cmd), "AT+CWLAP\r\n");
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 5);
+
+                process_apscan_response_buffer(resp_buf);
+            }
+
+            if (s_redraw) {
+                snprintf(temp_title, MAX_SIZE_TITLE, "Access Points (%d)", s_list_count);
+				draw_list(&m1_u8g2, temp_title, s_list_count, selection);
+            }
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_UP) {
+                if (selection > 0)
+                    selection--;
+                else if (s_list_count != 0)
+                    selection = s_list_count - 1;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_DOWN) {
+                if (selection < s_list_count - 1)
+                    selection++;
+                else
+                    selection = 0;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+            } else if (btn == GAME_BTN_RIGHT) {
+                if (s_list_count > 0) {
+                    list_item_t *s = &s_selected_ap;
+                    s->channel = s_list_items[selection].channel;
+                    strncpy(s->address, s_list_items[selection].address, MAX_SIZE_ADDRESS);
+                    strncpy(s->name, s_list_items[selection].name, MAX_SIZE_NAME);
+                    s_selected_sta[0] = 0;
+                    s_state++;
+                }
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_AP_CONF:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_redraw = true;
+            }
+
+			if (s_redraw)
+				draw_confirmation(&m1_u8g2);
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+            } else if (btn == GAME_BTN_RIGHT) {
+                s_state++;
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_STA_SELECT:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_list_count = 0;
+                selection = 0;
+                s_redraw = true;
+
+                show_message(TITLE_DEFAULT, "Starting STASCAN", NULL, 0);
+
+                snprintf(at_cmd, sizeof(at_cmd), "AT+STASCAN=1,%d,\"%s\"\r\n", s_selected_ap.channel, s_selected_ap.address);
+                resp_buf[0] = 0;
+                spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 1);
+            }
+
+            /* Poll for unsolicited +STASCAN responses */
+            resp_buf[0] = '\0';
+            spi_AT_send_recv("AT\r\n", resp_buf, sizeof(resp_buf), 1);
+            if (resp_buf[0] != '\0')
+            {
+                process_stascan_response_buffer(resp_buf);
+            }
+            //vTaskDelay(pdMS_TO_TICKS(STASCAN_POLL_INTERVAL_MS));
+
+            if (s_redraw) {
+                snprintf(temp_title, MAX_SIZE_TITLE, "Select Targets (%d)", s_list_count);
+				draw_list(&m1_u8g2, temp_title, s_list_count, selection);
+            }
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_UP) {
+                if (selection > 0)
+                    selection--;
+                else if (s_list_count != 0)
+                    selection = s_list_count - 1;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_DOWN) {
+                if (selection < s_list_count - 1)
+                    selection++;
+                else
+                    selection = 0;
+                s_redraw = true;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+                stascan_stop();
+            } else if (btn == GAME_BTN_RIGHT) {
+                if (s_list_count > 0) {
+                    strncpy(s_selected_sta, s_list_items[selection].address, MAX_SIZE_ADDRESS);
+                    s_state++;
+
+                    stascan_stop();
+                }
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_STA_CONF:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_redraw = true;
+            }
+
+			if (s_redraw)
+				draw_confirmation(&m1_u8g2);
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+            } else if (btn == GAME_BTN_RIGHT) {
+                s_state++;
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_ATTACK:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_redraw = true;
+
+                deauth_start(s_selected_ap.channel, s_selected_ap.address, s_selected_sta);
+            }
+
+            if (s_redraw)
+				draw_attack(&m1_u8g2);
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+                deauth_stop();
+            } else if (btn == GAME_BTN_OK) {
+                s_redraw = true;
+                if (s_deauth_active)
+                    deauth_stop();
+                else
+                    deauth_start(s_selected_ap.channel, s_selected_ap.address, s_selected_sta);
+            } else if (btn == GAME_BTN_RIGHT) {
+                s_state++;
+                deauth_stop();
+            }
+
+			break;
+
+        // ---------------------------------------
+		case STATE_COMPLETE:
+            if (s_state_previous != s_state) {
+                s_state_previous = s_state;
+                s_redraw = true;
+
+                deauth_stop();
+            }
+
+			if (s_redraw)
+				draw_complete(&m1_u8g2);
+
+            btn = game_poll_button(INPUT_POLL_DELAY);
+            if (btn == GAME_BTN_BACK) {
+                break;
+            } else if (btn == GAME_BTN_LEFT) {
+                s_state--;
+            } else if (btn == GAME_BTN_RIGHT) {
+                s_state = STATE_MENU;
+            }
+			break;
+		}
+
+        // Exit App
+        if (btn == GAME_BTN_BACK) {
+            break;
+        }
+	}
+
+    // Cleanup
+    deauth_stop();
+    vTaskDelay(pdMS_TO_TICKS(MULTI_AT_CMD_INTERVAL_MS));
+    stascan_stop();
+    return;
+
+wait_exit:
+	S_M1_Buttons_Status this_button_status;
+	S_M1_Main_Q_t q_item;
+	BaseType_t ret;
+
+    while (1)
+    {
+        ret = xQueueReceive(main_q_hdl, &q_item, portMAX_DELAY);
+        if (ret == pdTRUE && q_item.q_evt_type == Q_EVENT_KEYPAD)
+        {
+            xQueueReceive(button_events_q_hdl, &this_button_status, 0);
+            if (this_button_status.event[BUTTON_BACK_KP_ID] == BUTTON_EVENT_CLICK
+             || this_button_status.event[BUTTON_LEFT_KP_ID] == BUTTON_EVENT_CLICK
+             || this_button_status.event[BUTTON_OK_KP_ID] == BUTTON_EVENT_CLICK
+             || this_button_status.event[BUTTON_RIGHT_KP_ID] == BUTTON_EVENT_CLICK)
+                break;
+        }
+    }
+    xQueueReset(main_q_hdl);
+} // void lab_test_deauth(void)

@@ -8,8 +8,8 @@ add_library(m1_01 INTERFACE)
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
-target_compile_definitions(m1_01 INTERFACE 
-	USE_HAL_DRIVER 
+target_compile_definitions(m1_01 INTERFACE
+	USE_HAL_DRIVER
 	STM32H573xx
     STM32_THREAD_SAFE_STRATEGY=4
     $<$<CONFIG:Debug>:DEBUG>
@@ -52,6 +52,7 @@ target_include_directories(m1_01 INTERFACE
     ../../NFC/NFC_drv
     ../../NFC/NFC_drv/common
     ../../NFC/NFC_drv/legacy
+    ../../NFC/NFC_drv/legacy/picopass
     ../../Battery
     ../../lfrfid
     ../../USB
@@ -307,6 +308,9 @@ target_sources(m1_01 INTERFACE
     ../../NFC/NFC_drv/legacy/nfc_listener.c
     ../../NFC/NFC_drv/legacy/nfc_poller.c
     ../../NFC/NFC_drv/legacy/mfc_crypto1.c
+    ../../NFC/NFC_drv/legacy/picopass/picopass_cipher.c
+    ../../NFC/NFC_drv/legacy/picopass/picopass_poller.c
+    ../../NFC/NFC_drv/legacy/picopass/picopass_listener.c
     ../../NFC/app_x-cube-nfcx.c
     ../../Sub_Ghz/datatypes_utils.c
     ../../Sub_Ghz/m1_sub_ghz_api.c
@@ -434,6 +438,7 @@ target_sources(m1_01 INTERFACE
     ../../m1_csrc/m1_gpio.c
     ../../m1_csrc/m1_i2c.c
     ../../m1_csrc/m1_infrared.c
+    ../../m1_csrc/m1_deauth.c
     ../../m1_csrc/m1_int_hdl.c
     ../../m1_csrc/m1_lcd.c
     ../../m1_csrc/m1_led_indicator.c
