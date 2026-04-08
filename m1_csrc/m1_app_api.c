@@ -45,6 +45,7 @@
 #include "m1_power_ctl.h"
 #include "m1_sdcard.h"
 #include "m1_infrared.h"
+#include "m1_deauth.h"
 #include "flipper_file.h"
 #include "flipper_ir.h"
 #include "flipper_nfc.h"

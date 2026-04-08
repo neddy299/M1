@@ -8,8 +8,8 @@ add_library(m1_01 INTERFACE)
 # Enable CMake support for ASM and C languages
 enable_language(C ASM)
 
-target_compile_definitions(m1_01 INTERFACE 
-	USE_HAL_DRIVER 
+target_compile_definitions(m1_01 INTERFACE
+	USE_HAL_DRIVER
 	STM32H573xx
     STM32_THREAD_SAFE_STRATEGY=4
     $<$<CONFIG:Debug>:DEBUG>
@@ -438,6 +438,7 @@ target_sources(m1_01 INTERFACE
     ../../m1_csrc/m1_gpio.c
     ../../m1_csrc/m1_i2c.c
     ../../m1_csrc/m1_infrared.c
+    ../../m1_csrc/m1_deauth.c
     ../../m1_csrc/m1_int_hdl.c
     ../../m1_csrc/m1_lcd.c
     ../../m1_csrc/m1_led_indicator.c

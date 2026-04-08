@@ -20,6 +20,7 @@
 //#include "U8g2lib.h"
 #include "m1_gpio.h"
 #include "m1_infrared.h"
+#include "m1_deauth.h"
 #include "m1_nfc.h"
 #include "m1_rfid.h"
 #include "m1_settings.h"
@@ -409,6 +410,11 @@ S_M1_Menu_t menu_Wifi_Config =
     "Saved Networks", wifi_config, NULL, NULL, 0, 0, NULL, NULL, NULL
 };
 
+S_M1_Menu_t menu_Wifi_Deauth =
+{
+    "Deauther", lab_test_deauth, NULL, NULL, 0, 0, NULL, NULL, NULL
+};
+
 #ifdef M1_APP_WIFI_CONNECT_ENABLE
 S_M1_Menu_t menu_Wifi_Status =
 {
@@ -422,14 +428,14 @@ S_M1_Menu_t menu_Wifi_Disconnect =
 
 S_M1_Menu_t menu_Wifi =
 {
-    "Wifi", menu_wifi_init, NULL, NULL, 6, 0, menu_m1_icon_wifi, NULL,
-    {&menu_Wifi_Scan_AP, &menu_802154_Zigbee, &menu_802154_Thread, &menu_Wifi_Config, &menu_Wifi_Status, &menu_Wifi_Disconnect}
+    "Wifi", menu_wifi_init, NULL, NULL, 7, 0, menu_m1_icon_wifi, NULL,
+    {&menu_Wifi_Scan_AP, &menu_Wifi_Deauth, &menu_802154_Zigbee, &menu_802154_Thread, &menu_Wifi_Config, &menu_Wifi_Status, &menu_Wifi_Disconnect}
 };
 #else
 S_M1_Menu_t menu_Wifi =
 {
-    "Wifi", menu_wifi_init, NULL, NULL, 4, 0, menu_m1_icon_wifi, NULL,
-    {&menu_Wifi_Scan_AP, &menu_802154_Zigbee, &menu_802154_Thread, &menu_Wifi_Config}
+    "Wifi", menu_wifi_init, NULL, NULL, 5, 0, menu_m1_icon_wifi, NULL,
+    {&menu_Wifi_Scan_AP, &menu_Wifi_Deauth, &menu_802154_Zigbee, &menu_802154_Thread, &menu_Wifi_Config}
 };
 #endif
 
