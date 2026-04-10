@@ -21,7 +21,7 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 # Set the project name
-set(CMAKE_PROJECT_NAME M1_v0800_C3.12)
+set(CMAKE_PROJECT_NAME M1_v0800_C3.12_N299.1)
 
 # C3 fork revision — must match M1_C3_REVISION in m1_fw_update_bl.h
 set(M1_C3_REVISION 12)
@@ -93,7 +93,7 @@ set(TARGET_ELF "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.elf")
 set(TARGET_BIN "${CMAKE_BINARY_DIR}/${CMAKE_PROJECT_NAME}.bin")
 # Command to display memory usage
 add_custom_command(
-    COMMAND ${CMAKE_COMMAND} -E echo "Memory usage:"    
+    COMMAND ${CMAKE_COMMAND} -E echo "Memory usage:"
     TARGET ${CMAKE_PROJECT_NAME}
     POST_BUILD
     COMMAND ${CMAKE_SIZE} ${TARGET_ELF}

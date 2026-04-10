@@ -1,5 +1,45 @@
 <!-- See COPYING.txt for license details. -->
 
+# Neddy299 M1 Test Lab
+
+This is a cyber test lab project based on [cd3daddy's fork](https://github.com/bedge117/M1) of the original M1 [firmware](https://github.com/Monstatek/M1). This project is primarily focused on testing the M1's capabilities and will not always be up to date with the latest features provided by other third party firmware.
+
+With that said, here are some of the features included with this M1 fork.
+
+## Wi-Fi Deauthentication Attack
+
+> Usage of this feature should only be conducted on your own equipment and is for research purposes only!
+
+Conduct a Wi-Fi deauthentication attack against a wireless client. The deauther application is available under the Wifi section in the M1 main menu.
+
+### Important notes
+
+Due to the nature of current deauth attacks, only 2.4Ghz and WPA2 (and lower) protected networks are vulnerable.
+
+The deauth feature requires updating the M1's ESP32 firmware. An ESP32 deauth compatible firmware is available in [this project](https://github.com/neddy299/esp32-at-monstatek-m1/releases).
+
+If you do not update the firmware, you will be presented with the following screen and will not be able to use the deauth capability.
+
+![](./documentation/images/esp32-update-needed.png)
+
+
+# Installing this firmware
+
+It is recommended to use the [qMonstatek](https://github.com/bedge117/qMonstatek) app to flash both the M1 and ESP32 firmware.
+
+Install all of the following firmware:
+- Latest [neddy299 M1](https://github.com/neddy299/M1/releases) firmware (based on C3)
+- Latest [neddy299 ESP32](https://github.com/neddy299/esp32-at-monstatek-m1/releases) firmware (based on C3 ESP-AT)
+
+
+## Additional Notes
+
+The functionality implemented by these applications are based on and inspired by the [ESP32 Marauder](https://github.com/justcallmekoko/ESP32Marauder) project.
+
+
+-----------------------------
+-----------------------------
+
 # M1 Enhanced Firmware (C3)
 
 Enhanced firmware for the [Monstatek M1](https://monstatek.com) multi-tool device, forked from the [original firmware](https://github.com/Monstatek/M1) with significant feature additions, Flipper Zero file compatibility, and stability improvements.
